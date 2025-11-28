@@ -2,5 +2,7 @@ data/
 aifinalenv/
 logs/
 models/
+cache/
 
 .env
+training_log.log

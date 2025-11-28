@@ -3,6 +3,11 @@
 import requests
 import praw
 import tweepy
+import time
+import shelve
+import hashlib
+import json
+import os
 import config
 
 from abc import ABC, abstractmethod
@@ -47,31 +52,169 @@ class DarkWebCollector(BaseCollector):
         
 class TwitterCollector(BaseCollector):
     def __init__(self):
+        # Prefer using Tweepy v2 Client if a bearer token is provided
+        self.client_v2 = None
+        self.client = None
+        # Cache path for Twitter v2 query caching
+        self._cache_path = os.path.join(str(config.CACHE_DIR), 'twitter_cache.db')
+
+        if config.TWITTER_BEARER_TOKEN:
+            try:
+                self.client_v2 = tweepy.Client(bearer_token=config.TWITTER_BEARER_TOKEN)
+                logger.info("Initialized Twitter v2 client (Client) using bearer token.")
+                # don't return here so v1.1 fallback remains available on initialization errors
+            except Exception as e:
+                logger.warning(f"Failed to initialize Twitter v2 client: {e}")
+
+        # Fallback to v1.1 API using OAuth1 if all required keys are present
         if not all([config.TWITTER_API_KEY, config.TWITTER_API_SECRET,
                     config.TWITTER_ACCESS_TOKEN, config.TWITTER_ACCESS_SECRET]):
-            logger.warning("Twitter API credentials are not configured.")
-            self.client = None
+            logger.warning("Twitter API credentials are not configured for v1.1 usage.")
             return
-        
-        auth = tweepy.OAuth1UserHandler(
-            config.TWITTER_API_KEY,
-            config.TWITTER_API_SECRET
-        )
-        auth.set_access_token(
-            config.TWITTER_ACCESS_TOKEN,
-            config.TWITTER_ACCESS_SECRET
-        )
-        self.client = tweepy.API(auth)
+
+            try:
+                auth = tweepy.OAuth1UserHandler(
+                    config.TWITTER_API_KEY,
+                    config.TWITTER_API_SECRET
+                )
+                auth.set_access_token(
+                    config.TWITTER_ACCESS_TOKEN,
+                    config.TWITTER_ACCESS_SECRET
+                )
+                self.client = tweepy.API(auth)
+                logger.info("Initialized Twitter v1.1 API client (tweepy.API) using OAuth1.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Twitter v1.1 client: {e}")
+
+    # --- Simple on-disk cache helpers for v2 queries ---
+    def _cache_key(self, query: str, limit: int) -> str:
+        h = hashlib.sha256()
+        h.update(f"{query}\n{limit}".encode('utf-8'))
+        return h.hexdigest()
+
+    def _cache_get(self, key: str):
+        try:
+            with shelve.open(self._cache_path) as db:
+                item = db.get(key)
+                if not item:
+                    return None
+                payload = json.loads(item)
+                if time.time() - payload.get('ts', 0) > config.TWITTER_CACHE_TTL:
+                    # expired
+                    try:
+                        del db[key]
+                    except Exception:
+                        pass
+                    return None
+                return payload.get('data')
+        except Exception:
+            return None
+
+    def _cache_set(self, key: str, data):
+        try:
+            with shelve.open(self._cache_path) as db:
+                db[key] = json.dumps({'ts': time.time(), 'data': data})
+        except Exception:
+            pass
 
     def collect(self, query: str, limit: int = 100) -> List[Dict]:
+        results = []
+
+        # If v2 client exists, use recent search v2 endpoint
+        if self.client_v2:
+                # Check simple on-disk cache first
+                cache_key = self._cache_key(query, limit)
+                cached = self._cache_get(cache_key)
+                if cached is not None:
+                    logger.info(f"Returning {len(cached)} cached tweets (v2) for query: {query}")
+                    return cached
+
+                # Retry loop to handle rate limiting (429 Too Many Requests)
+                max_retries = getattr(config, 'TWITTER_V2_MAX_RETRIES', 3)
+                backoff_base = getattr(config, 'TWITTER_V2_BACKOFF_BASE', 2)
+                resp = None
+                for attempt in range(max_retries):
+                    try:
+                        # Request tweet text and author username via expansions
+                        resp = self.client_v2.search_recent_tweets(query=query, max_results=min(100, limit), tweet_fields=['created_at'], expansions=['author_id'], user_fields=['username'])
+                        break
+                    except Exception as e:
+                        try:
+                            from tweepy.errors import TooManyRequests, Forbidden, TweepyException
+                            # If the exception includes a response with rate limit headers, prefer sleeping until reset
+                            resp_obj = getattr(e, 'response', None)
+                            headers = getattr(resp_obj, 'headers', {}) if resp_obj is not None else {}
+                            if isinstance(e, TooManyRequests):
+                                # Prefer reset header if present
+                                reset = headers.get('x-rate-limit-reset') or headers.get('x-rate_limit_reset')
+                                retry_after = headers.get('retry-after')
+                                if reset:
+                                    try:
+                                        reset_ts = int(reset)
+                                        sleep_for = max(0, reset_ts - int(time.time()) + 5)
+                                    except Exception:
+                                        sleep_for = backoff_base ** attempt
+                                elif retry_after:
+                                    try:
+                                        sleep_for = int(retry_after)
+                                    except Exception:
+                                        sleep_for = backoff_base ** attempt
+                                else:
+                                    sleep_for = backoff_base ** attempt
+
+                                if sleep_for > 0 and attempt < max_retries - 1:
+                                    logger.warning(f"Twitter v2 rate limit hit (429). Sleeping {sleep_for}s before retry {attempt+1}/{max_retries}.")
+                                    time.sleep(min(sleep_for, 3600))
+                                    continue
+                                else:
+                                    logger.error("Twitter v2 API rate limit exceeded after retries.")
+                                    return results
+                            elif isinstance(e, Forbidden):
+                                logger.error("Twitter v2 API returned Forbidden (403): check your app permissions or access level for v2 endpoints.")
+                                return results
+                            elif isinstance(e, TweepyException):
+                                logger.error(f"Twitter v2 API error: {e}")
+                                return results
+                            else:
+                                logger.error(f"Unexpected error collecting data from Twitter v2: {e}")
+                                return results
+                        except Exception:
+                            logger.error(f"Unexpected error collecting data from Twitter v2: {e}")
+                            return results
+
+                if not resp:
+                    logger.error("No response from Twitter v2 after retries.")
+                    return results
+
+                tweets = resp.data or []
+                users = {str(u.id): u for u in (resp.includes.get('users', []) if resp.includes else [])}
+
+                for t in tweets:
+                    author = users.get(str(t.author_id)) if users else None
+                    username = author.username if author and hasattr(author, 'username') else str(t.author_id)
+                    results.append({
+                        'source': 'twitter',
+                        'text': t.text,
+                        'author': username,
+                        'timestamp': t.created_at.isoformat() if t.created_at else None,
+                        'url': f"https://twitter.com/{username}/status/{t.id}"
+                    })
+
+                logger.info(f"Collected {len(results)} tweets (v2) for query: {query}")
+                # Cache the results
+                try:
+                    self._cache_set(cache_key, results)
+                except Exception:
+                    pass
+
+        # Fall back to v1.1 API
         if not self.client:
             logger.warning("Twitter client is not initialized due to missing credentials.")
             return []
-        
-        results = []
+
         try:
             tweets = self.client.search_tweets(q=query, lang="en", count=limit, tweet_mode='extended')
-            
+
             for tweet in tweets:
                 results.append({
                     'source': 'twitter',
@@ -82,8 +225,22 @@ class TwitterCollector(BaseCollector):
                 })
 
             logger.info(f"Collected {len(results)} tweets for query: {query}")
-        except tweepy.TweepError as e:
-            logger.error(f"Error collecting data from Twitter: {e}")
+        except Exception as e:
+            # Modern tweepy raises exceptions under tweepy.errors (TweepyException and subclasses)
+            try:
+                from tweepy.errors import TweepyException, Forbidden
+                if isinstance(e, Forbidden):
+                    # 403 Forbidden typically means your app credentials are valid but your access
+                    # level doesn't allow use of this v1.1 endpoint (search_tweets).
+                    logger.error("Twitter API returned 403 Forbidden: your developer account may have limited access to this v1.1 endpoint. See https://developer.x.com/en/portal/product")
+                elif isinstance(e, TweepyException):
+                    logger.error(f"Twitter API error: {e}")
+                else:
+                    logger.error(f"Unexpected error collecting data from Twitter: {e}")
+            except Exception:
+                # If tweepy import or checks fail for some reason, log the raw exception
+                logger.error(f"Unexpected error collecting data from Twitter: {e}")
+        return results
         return results
     
 class RedditCollector(BaseCollector):
