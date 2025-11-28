@@ -24,9 +24,10 @@ class MITREMapper:
         self.attack_framework = None
         self.techniques = []
         self.tactics = []
-        self.vectorizer = TfidfVectorizer(max_features=1000)
+        # Use unigrams and bigrams, remove English stop words, increase feature space for better matching
+        self.vectorizer = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), stop_words='english')
         self.technique_vectors = None
-        
+
         self._load_attack_data()
     
     def _load_attack_data(self):
@@ -110,7 +111,8 @@ class MITREMapper:
         
         # Create vectors for similarity matching
         if self.techniques:
-            descriptions = [t['description'] for t in self.techniques]
+            # Combine technique name and description to improve recall
+            descriptions = [f"{t['name']}. {t['description']}" for t in self.techniques]
             self.technique_vectors = self.vectorizer.fit_transform(descriptions)
         
         logger.info(f"Parsed {len(self.techniques)} techniques and {len(self.tactics)} tactics")

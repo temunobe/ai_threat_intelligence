@@ -12,7 +12,7 @@ import config
 def setup_logging():
     """Configure logging"""
     logger.add(
-        config.LOGS_DIR / "platform.log",
+        config.LOG_DIR / "platform.log",
         rotation="10 MB",
         retention="7 days",
         level=config.LOG_LEVEL,

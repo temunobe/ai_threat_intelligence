@@ -36,13 +36,13 @@ echo "=========================================="
 echo ""
 
 # Download spaCy model
-echo ""
-echo "Downloading spaCy language model..."
-python -m spacy download en_core_web_sm
+# echo ""
+# echo "Downloading spaCy language model..."
+# python -m spacy download en_core_web_sm
 
 # Run as single process - device_map="auto" handles multi-GPU
 source ./aifinalenv/bin/activate
-python main.py dashboard
+python run.py --query ransomware --sources twitter,reddit --limit 50 --output outputs/results.json
 #accelerate launch --multi_gpu --num_processes 2 iomt_policy_generation.py
 
 echo ""
