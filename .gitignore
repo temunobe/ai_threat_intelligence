@@ -1,0 +1,6 @@
+data/
+aifinalenv/
+logs/
+models/
+
+.env
