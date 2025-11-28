@@ -11,6 +11,7 @@ from loguru import logger
 import config
 from data_collector import ThreatDataCollector
 from mitre_mapper import MITREMapper
+from ner_model import ThreatNERModel
 
 
 def main():
@@ -20,6 +21,7 @@ def main():
     parser.add_argument('--limit', '-n', type=int, default=50, help='Per-source limit')
     parser.add_argument('--output', '-o', default=str(config.DATA_DIR / 'outputs' / 'results.json'), help='Output JSON file')
     parser.add_argument('--threshold', '-t', type=float, default=getattr(config, 'MITRE_SIMILARITY_THRESHOLD', 0.7), help='MITRE similarity threshold (0-1)')
+    parser.add_argument('--use-ner', action='store_true', help='Load NER model and extract entities for each item (requires trained model)')
 
     args = parser.parse_args()
 
@@ -34,6 +36,21 @@ def main():
     collector = ThreatDataCollector()
     mapper = MITREMapper()
 
+    ner_model = None
+    if args.use_ner:
+        try:
+            ner_model = ThreatNERModel()
+            model_path = config.MODELS_DIR / 'threat-ner'
+            if model_path.exists():
+                ner_model.load_model(str(model_path))
+                logger.info('Loaded NER model successfully')
+            else:
+                logger.warning(f"NER model not found at {model_path}; continuing without NER")
+                ner_model = None
+        except Exception as e:
+            logger.warning(f"Failed to load NER model: {e}")
+            ner_model = None
+
     # Run collection
     results = collector.collect_all(args.query, sources=sources, limit=args.limit)
 
@@ -41,7 +58,29 @@ def main():
     processed = []
     for item in results:
         text = item.get('text') or item.get('title') or ''
-        mappings = mapper.map_text_to_techniques(text, threshold=args.threshold) if text else []
+        # Extract entities using NER if available
+        entities = {}
+        if ner_model and text:
+            try:
+                entities = ner_model.extract_entities(text)
+                item['entities'] = entities
+            except Exception as e:
+                logger.warning(f"NER extraction failed for item: {e}")
+                item['entities'] = {}
+        else:
+            item['entities'] = item.get('entities', {})
+
+        # Prefer mapping by entities if available, otherwise use text
+        mappings = []
+        if item['entities'] and any(item['entities'].values()):
+            try:
+                mappings = mapper.map_entities_to_techniques(item['entities'])
+            except Exception as e:
+                logger.warning(f"MITRE mapping by entities failed: {e}")
+                mappings = mapper.map_text_to_techniques(text, threshold=args.threshold) if text else []
+        else:
+            mappings = mapper.map_text_to_techniques(text, threshold=args.threshold) if text else []
+
         item['mitre_mappings'] = mappings
         processed.append(item)
 

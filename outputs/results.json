@@ -1,0 +1,8 @@
+{
+  "query": "ransomware",
+  "sources": [
+    "twitter",
+    "reddit"
+  ],
+  "results": []
+}
